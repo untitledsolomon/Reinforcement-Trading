@@ -6,21 +6,24 @@ def load_and_preprocess_data(csv_path: str):
     """
     Loads EURUSD data from CSV and preprocesses it by adding RELATIVE technical features.
 
-    CSV expected columns: [Time (EET), Open, High, Low, Close, Volume]
     The returned DataFrame still contains OHLCV for env internals,
     but `feature_cols` lists only the RELATIVE columns to feed the agent.
     """
-    df = pd.read_csv(
-        csv_path,
-        parse_dates=["Time (EET)"],
-        dayfirst=True,
-    )
+    df = pd.read_csv(csv_path)
 
     # Strip any trailing spaces in headers (e.g. 'Volume ')
     df.columns = df.columns.str.strip()
 
-    # Datetime index
-    df = df.set_index("Time (EET)")
+    # Detect time column
+    time_col = None
+    for col in ["Time (EET)", "Gmt time", "time", "Date"]:
+        if col in df.columns:
+            time_col = col
+            break
+
+    if time_col:
+        df[time_col] = pd.to_datetime(df[time_col], dayfirst=True)
+        df = df.set_index(time_col)
     df.sort_index(inplace=True)
 
     # Ensure numeric
@@ -64,3 +67,19 @@ def load_and_preprocess_data(csv_path: str):
     ]
 
     return df, feature_cols
+
+
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+
+def fit_scaler(df: pd.DataFrame, feature_cols: list):
+    """Fit a StandardScaler on the provided feature columns. Returns scaler."""
+    scaler = StandardScaler()
+    scaler.fit(df[feature_cols].values)
+    return scaler
+
+def apply_scaler(df: pd.DataFrame, feature_cols: list, scaler) -> pd.DataFrame:
+    """Apply a pre-fitted scaler to a dataframe. Returns a copy."""
+    df = df.copy()
+    df[feature_cols] = scaler.transform(df[feature_cols].values)
+    return df
