@@ -60,6 +60,7 @@ class ForexTradingEnv(gym.Env):
         hold_reward_weight: float = 0.005,   # tuned below
         open_penalty_pips: float = 0.5,      # NEW: penalty per open
         time_penalty_pips: float = 0.02,     # NEW: cost per bar in a trade
+        max_drawdown_pct: float = 0.20,      # NEW: terminate if drawdown hits this
     ):
         super().__init__()
 
@@ -139,6 +140,10 @@ class ForexTradingEnv(gym.Env):
         # Internal state
         self._reset_state()
 
+        # Drawdown termination
+        self.max_drawdown_pct = float(max_drawdown_pct)
+        self.peak_equity = self.initial_equity_usd
+
     # ----------------------------
     # Core Helpers
     # ----------------------------
@@ -149,6 +154,11 @@ class ForexTradingEnv(gym.Env):
         self.terminated = False
         self.truncated = False
 
+        # Accounting
+        self.initial_equity_usd = 10000.0
+        self.equity_usd = self.initial_equity_usd
+        self.peak_equity = self.initial_equity_usd
+
         # Position state
         self.position = 0              # 0=flat, +1=long, -1=short
         self.entry_price = None
@@ -156,10 +166,6 @@ class ForexTradingEnv(gym.Env):
         self.tp_price = None
         self.time_in_trade = 0
         self.prev_unrealized_pips = 0.0
-
-        # Accounting
-        self.initial_equity_usd = 10000.0
-        self.equity_usd = self.initial_equity_usd
 
         # Logging
         self.equity_curve = []
@@ -183,13 +189,17 @@ class ForexTradingEnv(gym.Env):
             pnl_price = self.entry_price - close_price
         return pnl_price / self.pip_value
 
-    def _apply_optional_normalization(self, obs: np.ndarray) -> np.ndarray:
+    def _apply_optional_normalization(self, obs_base: np.ndarray) -> np.ndarray:
         if self.feature_mean is None or self.feature_std is None:
-            return obs
-        mean = self.feature_mean.reshape(1, 1, -1)
-        std = self.feature_std.reshape(1, 1, -1)
-        std = np.where(std == 0, 1.0, std)
-        return (obs - mean) / std
+            return obs_base
+
+        # self.feature_mean and self.feature_std are for the base features only
+        # base features are the first self.base_num_features columns
+        mean = self.feature_mean.astype(np.float32)
+        std  = self.feature_std.astype(np.float32)
+        std  = np.where(std == 0, 1.0, std)
+
+        return (obs_base - mean) / std
 
     def _get_observation(self):
         start = self.current_step - self.window_size
@@ -215,8 +225,11 @@ class ForexTradingEnv(gym.Env):
         state_block = np.tile(state_feat, (self.window_size, 1))
         obs = np.hstack([base, state_block]).astype(np.float32)
 
-        # Optional normalization (only if user passes train-fitted mean/std matching obs dims)
-        obs = self._apply_optional_normalization(obs)
+        # Optional normalization (only if user passes train-fitted mean/std matching base features)
+        base_norm = self._apply_optional_normalization(base)
+
+        # Re-stack with state features
+        obs = np.hstack([base_norm, state_block]).astype(np.float32)
 
         return obs
 
@@ -439,28 +452,36 @@ class ForexTradingEnv(gym.Env):
 
             self.prev_unrealized_pips = unreal_now
 
+        # 4) Update peak equity & check drawdown termination
+        if self.equity_usd > self.peak_equity:
+            self.peak_equity = self.equity_usd
 
+        current_dd = (self.peak_equity - self.equity_usd) / (self.peak_equity + 1e-9)
+        if current_dd >= self.max_drawdown_pct:
+            self.terminated = True
+            reward_pips -= 50.0 # Large penalty for blowing the account
 
-        # 4) Advance time
+        # 5) Advance time
         self.current_step += 1
 
-        # 5) Termination / truncation
-        if self.current_step >= self.n_steps - 1:
-            self.terminated = True
+        # 6) Termination / truncation (if not already terminated by drawdown)
+        if not self.terminated:
+            if self.current_step >= self.n_steps - 1:
+                self.terminated = True
 
-        if self.episode_max_steps is not None and self.steps_in_episode >= self.episode_max_steps:
-            self.truncated = True
+            if self.episode_max_steps is not None and self.steps_in_episode >= self.episode_max_steps:
+                self.truncated = True
 
-        # 6) Log equity
+        # 7) Log equity
         self.equity_curve.append(float(self.equity_usd))
 
-        # 7) Build observation
+        # 8) Build observation
         obs = self._get_observation()
 
-        # 8) Final reward scaling
+        # 9) Final reward scaling
         reward = float(reward_pips) * self.reward_scale
 
-        # 9) Info
+        # 10) Info
         info.update({
             "equity_usd": float(self.equity_usd),
             "position": int(self.position),

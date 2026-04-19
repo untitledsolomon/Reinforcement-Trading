@@ -6,8 +6,10 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback
 
-from indicators import load_and_preprocess_data
+from indicators import load_and_preprocess_data, fit_scaler
 from trading_env import ForexTradingEnv
+import pickle
+from config import TRAIN_DATA_PATH, MODEL_DIR, CHECKPOINT_DIR, DEFAULT_WINDOW_SIZE, DEFAULT_SL_OPTIONS, DEFAULT_TP_OPTIONS, DEFAULT_SPREAD_PIPS, DEFAULT_SLIPPAGE_PIPS
 
 
 def evaluate_model(model: PPO, eval_env: DummyVecEnv, deterministic: bool = True):
@@ -39,22 +41,30 @@ def evaluate_model(model: PPO, eval_env: DummyVecEnv, deterministic: bool = True
 
 
 def main():
-    #file_path = "data/EURUSD_15 Mins_Ask_2020.12.06_2025.12.12.csv"
-    file_path = "data/EURUSD_Hourly_Ask_2015.12.01_2025.12.16.csv"
-    df, feature_cols = load_and_preprocess_data(file_path)
+    df, feature_cols = load_and_preprocess_data(TRAIN_DATA_PATH)
 
     # Time split 80/20
     split_idx = int(len(df) * 0.8)
     train_df = df.iloc[:split_idx].copy()
-    test_df = df.iloc[split_idx:].copy()
+    val_df   = df.iloc[split_idx:].copy()
+
+    # Fit ONLY on training data
+    scaler = fit_scaler(train_df, feature_cols)
+    feature_mean = scaler.mean_.astype(np.float32)
+    feature_std  = scaler.scale_.astype(np.float32)
+
+    # Save scaler
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    with open(os.path.join(MODEL_DIR, "scaler.pkl"), "wb") as f:
+        pickle.dump(scaler, f)
 
     print("Training bars:", len(train_df))
-    print("Testing bars :", len(test_df))
+    print("Testing bars :", len(val_df))
 
     # ---- Env factories ----
-    SL_OPTS = [5, 10, 15, 25, 30, 60, 90, 120]
-    TP_OPTS = [5, 10, 15, 25, 30, 60, 90, 120]
-    WIN = 30
+    SL_OPTS = DEFAULT_SL_OPTIONS
+    TP_OPTS = DEFAULT_TP_OPTIONS
+    WIN = DEFAULT_WINDOW_SIZE
 
     # Train env: random starts to reduce memorization
     def make_train_env():
@@ -63,13 +73,15 @@ def main():
             window_size=WIN,
             sl_options=SL_OPTS,
             tp_options=TP_OPTS,
-            spread_pips=1.0,
+            spread_pips=DEFAULT_SPREAD_PIPS,
             commission_pips=0.0,
-            max_slippage_pips=0.2,
+            max_slippage_pips=DEFAULT_SLIPPAGE_PIPS,
             random_start=True,
             min_episode_steps=1000,
             episode_max_steps=2000,
             feature_columns=feature_cols,
+            feature_mean=feature_mean,
+            feature_std=feature_std,
             hold_reward_weight=0.0,#0.05
             open_penalty_pips=0.0,      # 0.5 half a pip per open
             time_penalty_pips=0.0,     # 0.02 pips per bar in trade
@@ -83,12 +95,14 @@ def main():
             window_size=WIN,
             sl_options=SL_OPTS,
             tp_options=TP_OPTS,
-            spread_pips=1.0,
+            spread_pips=DEFAULT_SPREAD_PIPS,
             commission_pips=0.0,
-            max_slippage_pips=0.2,
+            max_slippage_pips=DEFAULT_SLIPPAGE_PIPS,
             random_start=False,
             episode_max_steps=None,
             feature_columns=feature_cols,
+            feature_mean=feature_mean,
+            feature_std=feature_std,
             hold_reward_weight=0.00,
             open_penalty_pips=0.0,      # half a pip per open
             time_penalty_pips=0.0,     # 0.02 pips per bar in trade
@@ -98,16 +112,18 @@ def main():
     # Test-eval env: deterministic
     def make_test_eval_env():
         return ForexTradingEnv(
-            df=test_df,
+            df=val_df,
             window_size=WIN,
             sl_options=SL_OPTS,
             tp_options=TP_OPTS,
-            spread_pips=1.0,
+            spread_pips=DEFAULT_SPREAD_PIPS,
             commission_pips=0.0,
-            max_slippage_pips=0.2,
+            max_slippage_pips=DEFAULT_SLIPPAGE_PIPS,
             random_start=False,
             episode_max_steps=None,
             feature_columns=feature_cols,
+            feature_mean=feature_mean,
+            feature_std=feature_std,
             hold_reward_weight=0.00,
             open_penalty_pips=0.0,      # half a pip per open
             time_penalty_pips=0.00,     # 0.02 pips per bar in trade
@@ -127,12 +143,12 @@ def main():
     )
 
     # ---- Checkpoints ----
-    ckpt_dir = "./checkpoints"
-    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(MODEL_DIR, exist_ok=True)
 
     checkpoint_callback = CheckpointCallback(
         save_freq=50_000,
-        save_path=ckpt_dir,
+        save_path=CHECKPOINT_DIR,
         name_prefix="ppo_eurusd"
     )
 
@@ -148,12 +164,12 @@ def main():
     best_path = None
 
     ckpts = sorted(
-        [f for f in os.listdir(ckpt_dir) if f.endswith(".zip") and f.startswith("ppo_eurusd")],
-        key=lambda x: os.path.getmtime(os.path.join(ckpt_dir, x))
+        [f for f in os.listdir(CHECKPOINT_DIR) if f.endswith(".zip") and f.startswith("ppo_eurusd")],
+        key=lambda x: os.path.getmtime(os.path.join(CHECKPOINT_DIR, x))
     )
 
     for ck in ckpts:
-        ck_path = os.path.join(ckpt_dir, ck)
+        ck_path = os.path.join(CHECKPOINT_DIR, ck)
         try:
             m = PPO.load(ck_path, env=test_eval_env)
             _, final_eq = evaluate_model(m, test_eval_env)
@@ -172,8 +188,9 @@ def main():
         print(f"Using best checkpoint: {best_path} (OOS final equity: {best_equity:.2f})")
         best_model = PPO.load(best_path, env=train_vec_env)
 
-    best_model.save("model_eurusd_best")
-    print("Best model saved: model_eurusd_best")
+    best_model_path = os.path.join(MODEL_DIR, "best_model")
+    best_model.save(best_model_path)
+    print(f"Best model saved: {best_model_path}")
 
     # ---- Plot BOTH: in-sample vs out-of-sample ----
     equity_curve_train, final_equity_train = evaluate_model(best_model, train_eval_env)
